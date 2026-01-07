@@ -1,0 +1,8 @@
+final/*
+photo/*
+source/*
+!final/.gitignore
+!photo/.gitignore
+!source/.gitignore
+.idea/
+.venv/
