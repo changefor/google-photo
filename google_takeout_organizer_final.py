@@ -19,7 +19,9 @@ SOURCE_DIR = r"source"
 TARGET_DIR = r"final"
 TMP_DIR = r"C:\tmp\TakeoutTmp"
 
-MEDIA_EXT = (".jpg", ".jpeg", ".png", ".mp4", ".mov")
+MEDIA_EXT = (".jpg", ".jpeg", ".png", ".mp4", ".mov",".heic"
+                 , ".heif", ".avi", ".mkv", ".wmv", ".3gp"
+                 , ".gif", ".tiff", ".webp", ".cr2")
 
 # ================= GEO =================
 GEO_CACHE_FILE = os.path.join(TARGET_DIR, "geo_cache.json")
