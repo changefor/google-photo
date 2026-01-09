@@ -9,6 +9,7 @@ import subprocess
 from datetime import datetime
 from collections import defaultdict
 import exifread
+import folium
 import reverse_geocoder as rg
 
 import time
@@ -38,6 +39,7 @@ gps_points = []  # for HTML map
 gps_by_day = defaultdict(set)
 year_city_count = defaultdict(lambda: defaultdict(int))
 city_total_count = defaultdict(int)
+yearly_locations = defaultdict(list)
 
 # ================= UTIL =================
 def load_geo_cache():
@@ -217,6 +219,10 @@ def process_media(path):
     if not place:
         return
 
+    city, country = place
+    yearly_locations[dt.year].append(
+            (gps[0], gps[1], city, country, path)
+        )
     gps_points.append((gps[0], gps[1], dt.strftime("%Y-%m-%d"), place))
     gps_by_day[day_dir].add(place)
     year_city_count[dt.year][place] += 1
@@ -248,6 +254,33 @@ L.marker([{lat},{lon}]).addTo(map)
 
     with open(os.path.join(TARGET_DIR, "photo_map.html"), "w", encoding="utf-8") as f:
         f.write(html)
+
+def generate_year_map(points, map_path, year):
+    # points: [(lat, lon, city, country, filepath), ...]
+
+    # 地圖中心：第一張
+    center_lat, center_lon = points[0][0], points[0][1]
+
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=6,
+        tiles="OpenStreetMap"
+    )
+
+    for lat, lon, city, country, path in points:
+        popup = f"""
+        <b>{city}, {country}</b><br>
+        {os.path.basename(path)}
+        """
+
+        folium.CircleMarker(
+            location=[lat, lon],
+            radius=4,
+            popup=popup,
+            fill=True
+        ).add_to(m)
+
+    m.save(map_path)
 
 # ================= REPORT =================
 def write_reports():
@@ -306,6 +339,15 @@ def main():
     save_geo_cache()
     write_reports()
     write_html_map()
+    for year, points in yearly_locations.items():
+        if not points:
+            continue
+
+        year_dir = os.path.join(TARGET_DIR, str(year))
+        map_path = os.path.join(year_dir, "map.html")
+
+        generate_year_map(points, map_path, year)
+
     print("✅ Offline-final processing completed")
     print(time.time() - start)
 
