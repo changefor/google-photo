@@ -2,52 +2,51 @@ import os
 import zipfile
 import json
 import shutil
-import hashlib
 import re
 import io
 import contextlib
 import subprocess
-import requests
 from datetime import datetime
-import exifread
 from collections import defaultdict
+import exifread
+import reverse_geocoder as rg
 
-# ========= PATH =========
-SOURCE_DIR = "source"
-TARGET_DIR = "final"
-TMP_DIR = "/tmp/takeout_tmp"
-UNCLASSIFIED_DIR = os.path.join(TARGET_DIR, "unclassified")
-
-# ========= FILES =========
-HASH_DB = os.path.join(TARGET_DIR, "hash_index.json")
-DUP_FILE = os.path.join(TARGET_DIR, "duplicate_files.txt")
-UNCLASS_FILE = os.path.join(TARGET_DIR, "unclassified_files.txt")
-FMT_ERR_FILE = os.path.join(TARGET_DIR, "file_format_not_recognized.txt")
-CORRUPT_FILE = os.path.join(TARGET_DIR, "corrupted_exif_files.txt")
-FILENAME_FALLBACK_FILE = os.path.join(TARGET_DIR, "used_filename_fallback.txt")
-NO_LOC_FILE = os.path.join(TARGET_DIR, "no_location_list.txt")
+# ================= CONFIG =================
+SOURCE_DIR = r"source"
+TARGET_DIR = r"final"
+TMP_DIR = r"C:\tmp\TakeoutTmp"
 
 MEDIA_EXT = (".jpg", ".jpeg", ".png", ".mp4", ".mov")
 
-# ========= MEMORY =========
-hash_index = {}
-duplicate_files = []
-unclassified_files = []
+# ================= GEO =================
+GEO_CACHE_FILE = os.path.join(TARGET_DIR, "geo_cache.json")
+geo_cache = {}
+rg_engine = rg.RGeocoder(mode=1, verbose=False)
+
+# ================= LOGS =================
 file_format_errors = []
 corrupted_exif_files = []
+unclassified_files = []
 filename_fallback_files = []
-no_loc_files = []
+reverse_geocode_failed = []
+ffprobe_failed = []
 
-gps_by_day = defaultdict(list)   # YYYY/MM/DD -> [(lat, lon)]
+# ================= STATS =================
+gps_points = []  # for HTML map
+gps_by_day = defaultdict(set)
+year_city_count = defaultdict(lambda: defaultdict(int))
+city_total_count = defaultdict(int)
 
-# ========= UTIL =========
-def file_hash(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for c in iter(lambda: f.read(8192), b""):
-            h.update(c)
-    return h.hexdigest()
+# ================= UTIL =================
+def load_geo_cache():
+    global geo_cache
+    if os.path.exists(GEO_CACHE_FILE):
+        with open(GEO_CACHE_FILE, "r", encoding="utf-8") as f:
+            geo_cache = json.load(f)
 
+def save_geo_cache():
+    with open(GEO_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(geo_cache, f, ensure_ascii=False, indent=2)
 
 def safe_copy(src, dest_dir):
     os.makedirs(dest_dir, exist_ok=True)
@@ -59,28 +58,17 @@ def safe_copy(src, dest_dir):
         dest = os.path.join(dest_dir, f"{name}_{i}{ext}")
         i += 1
     shutil.copy2(src, dest)
-    return dest
 
-
-# ========= DATE FROM FILENAME =========
 def datetime_from_filename(filename):
-    patterns = [
-        r"(20\d{2})(\d{2})(\d{2})",
-        r"(20\d{2})[-_](\d{2})[-_](\d{2})",
-        r"(20\d{2})(\d{2})(\d{2})[_-]\d{6}",
-    ]
-    for p in patterns:
-        m = re.search(p, filename)
-        if m:
-            try:
-                y, mo, d = map(int, m.groups()[:3])
-                return datetime(y, mo, d)
-            except ValueError:
-                pass
+    m = re.search(r"(20\d{2})[-_]?(\d{2})[-_]?(\d{2})", filename)
+    if m:
+        try:
+            return datetime(int(m[1]), int(m[2]), int(m[3]))
+        except:
+            pass
     return None
 
-
-# ========= EXIF =========
+# ================= EXIF =================
 def read_exif(path):
     try:
         with open(path, "rb") as f:
@@ -92,58 +80,68 @@ def read_exif(path):
         if "File format not recognized" in err:
             file_format_errors.append(path)
             return None, None
-
         if "Possibly corrupted" in err:
             corrupted_exif_files.append(path)
 
         dt = tags.get("EXIF DateTimeOriginal")
-        gps_lat = tags.get("GPS GPSLatitude")
-        gps_lon = tags.get("GPS GPSLongitude")
-
         dt_val = datetime.strptime(str(dt), "%Y:%m:%d %H:%M:%S") if dt else None
-        return dt_val, (gps_lat, gps_lon) if gps_lat and gps_lon else None
+
+        lat = tags.get("GPS GPSLatitude")
+        lon = tags.get("GPS GPSLongitude")
+        lat_ref = tags.get("GPS GPSLatitudeRef")
+        lon_ref = tags.get("GPS GPSLongitudeRef")
+
+        if lat and lon and lat_ref and lon_ref:
+            def conv(v):
+                d, m, s = [float(x.num) / float(x.den) for x in v.values]
+                return d + m / 60 + s / 3600
+            latitude = conv(lat)
+            longitude = conv(lon)
+            if lat_ref.values != "N":
+                latitude = -latitude
+            if lon_ref.values != "E":
+                longitude = -longitude
+            return dt_val, (latitude, longitude)
+
+        return dt_val, None
     except Exception as e:
         corrupted_exif_files.append(f"{path} | {e}")
         return None, None
 
-
-# ========= METADATA.JSON =========
+# ================= METADATA.JSON =================
 def read_metadata_json(path):
     jp = path + ".json"
     if not os.path.exists(jp):
         return None, None
     try:
-        with open(jp, "r", encoding="utf-8") as f:
+        with open(jp, encoding="utf-8") as f:
             data = json.load(f)
-
         ts = data.get("photoTakenTime", {}).get("timestamp")
         geo = data.get("geoData") or data.get("geoDataExif")
-
         dt = datetime.fromtimestamp(int(ts)) if ts else None
-        loc = (geo["latitude"], geo["longitude"]) if geo and geo.get("latitude") else None
-        return dt, loc
+        gps = (geo["latitude"], geo["longitude"]) if geo and geo.get("latitude") else None
+        return dt, gps
     except Exception as e:
         corrupted_exif_files.append(f"{jp} | {e}")
         return None, None
 
-
-# ========= VIDEO TIME =========
+# ================= VIDEO =================
 def read_video_time(path):
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-show_entries",
-             "format_tags=creation_time",
+            ["ffprobe", "-v", "quiet",
+             "-show_entries", "format_tags=creation_time",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
             capture_output=True, text=True
         )
         if r.stdout.strip():
             return datetime.fromisoformat(r.stdout.strip().replace("Z", "+00:00"))
-    except Exception:
+    except:
         pass
+    ffprobe_failed.append(path)
     return None
 
-
-# ========= DATE + GPS =========
+# ================= RESOLVE =================
 def resolve_datetime_and_gps(path):
     dt, gps = read_exif(path)
     if dt:
@@ -165,140 +163,147 @@ def resolve_datetime_and_gps(path):
 
     try:
         return datetime.fromtimestamp(os.path.getmtime(path)), None
-    except Exception:
+    except:
+        unclassified_files.append(path)
         return None, None
 
-
-# ========= GEO =========
-def reverse_geocode(lat, lon):
-    try:
-        print(lat)
-        print(lon)
-        r = requests.get(
-            "https://nominatim.openstreetmap.org/reverse",
-            params={
-                "lat": lat,
-                "lon": lon,
-                "format": "json",
-                "zoom": 10,
-            },
-            headers={"User-Agent": "GoogleTakeoutOrganizer/1.0"},
-            timeout=10,
-        )
-        a = r.json().get("address", {})
-        print(r.json)
-        city = a.get("city") or a.get("town") or a.get("county")
-        country = a.get("country")
-        return ", ".join(filter(None, [city, country]))
-    except Exception:
+# ================= OFFLINE GEO =================
+def reverse_geocode_city_offline(lat, lon):
+    # 過濾假 GPS
+    if abs(lat) < 0.001 and abs(lon) < 0.001:
+        reverse_geocode_failed.append(f"{lat},{lon} zero")
         return None
 
+    key = f"{round(lat,4)},{round(lon,4)}"
+    if key in geo_cache:
+        return tuple(geo_cache[key]) if geo_cache[key] else None
 
-# ========= PROCESS =========
+    try:
+        # ⚠️ 一定要用 list 包起來
+        results = rg.search([(lat, lon)], mode=1)
+        if not results:
+            reverse_geocode_failed.append(f"{lat},{lon} no result")
+            geo_cache[key] = None
+            return None
+
+        r = results[0]
+        city = r.get("name")
+        country = r.get("cc")
+
+        place = (city, country) if city and country else None
+        geo_cache[key] = list(place) if place else None
+        return place
+
+    except Exception as e:
+        reverse_geocode_failed.append(f"{lat},{lon} | {e}")
+        geo_cache[key] = None
+        return None
+
+# ================= PROCESS =================
 def process_media(path):
-    h = file_hash(path)
-    if h in hash_index:
-        duplicate_files.append(f"{path} -> {hash_index[h]}")
-        return
-
     dt, gps = resolve_datetime_and_gps(path)
     if not dt:
-        unclassified_files.append(path)
-        dest = safe_copy(path, UNCLASSIFIED_DIR)
-        hash_index[h] = dest
         return
 
-    folder = os.path.join(TARGET_DIR, str(dt.year), f"{dt.month:02}", f"{dt.day:02}")
-    dest = safe_copy(path, folder)
-    hash_index[h] = dest
+    day_dir = os.path.join(TARGET_DIR, str(dt.year), f"{dt.month:02}", f"{dt.day:02}")
+    safe_copy(path, day_dir)
 
-    if gps:
-        gps_by_day[folder].append(gps)
-        #print(path)
-    else:
-        no_loc_files.append(path)
+    if not gps:
+        return
 
+    place = reverse_geocode_city_offline(*gps)
+    if not place:
+        return
 
-def process_zip(zip_path):
-    with zipfile.ZipFile(zip_path, "r") as z:
-        for name in z.namelist():
-            if name.lower().endswith(MEDIA_EXT):
-                process_media(z.extract(name, TMP_DIR))
+    gps_points.append((gps[0], gps[1], dt.strftime("%Y-%m-%d"), place))
+    gps_by_day[day_dir].add(place)
+    year_city_count[dt.year][place] += 1
+    city_total_count[place] += 1
 
+# ================= HTML MAP =================
+def write_html_map():
+    html = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Photo Map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<style>#map{height:100vh;}</style>
+</head>
+<body>
+<div id="map"></div>
+<script>
+var map = L.map('map').setView([25, 121], 4);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+"""
+    for lat, lon, date, (city, country) in gps_points:
+        html += f"""
+L.marker([{lat},{lon}]).addTo(map)
+ .bindPopup("{date}<br>{city}, {country}");
+"""
+    html += "</script></body></html>"
 
-# ========= LOCATION.TXT =========
-def write_location_files():
-    for folder, gps_list in gps_by_day.items():
-        loc_count = defaultdict(int)
-        for lat, lon in gps_list:
-            print(lat.values, lon)
-            decimal_lat = convert_to_decimal(lat.values)
-            decimal_lon = convert_to_decimal(lon.values)
-            loc = reverse_geocode(decimal_lat, decimal_lon)
-            place = reverse_geocode(decimal_lat, decimal_lon)
-            if place:
-                loc_count[place] += 1
+    with open(os.path.join(TARGET_DIR, "photo_map.html"), "w", encoding="utf-8") as f:
+        f.write(html)
 
-        if not loc_count:
-            continue
+# ================= REPORT =================
+def write_reports():
+    with open(os.path.join(TARGET_DIR, "city_ranking.txt"), "w", encoding="utf-8") as f:
+        for i, ((c, ct), cnt) in enumerate(sorted(city_total_count.items(), key=lambda x: -x[1]), 1):
+            f.write(f"{i}. {c}, {ct} : {cnt}\n")
 
-        total = sum(loc_count.values())
-        main = max(loc_count.items(), key=lambda x: x[1])
+    with open(os.path.join(TARGET_DIR, "year_location_summary.txt"), "w", encoding="utf-8") as f:
+        for y, cities in sorted(year_city_count.items()):
+            f.write(f"{y}\n")
+            for (c, ct), cnt in sorted(cities.items(), key=lambda x: -x[1]):
+                f.write(f"  {c}, {ct} : {cnt}\n")
+            f.write("\n")
 
-        with open(os.path.join(folder, "location.txt"), "w", encoding="utf-8") as f:
-            f.write("主要拍攝地點：\n")
-            f.write(f"{main[0]}\n\n")
-            f.write("涵蓋地點：\n")
-            for k, v in sorted(loc_count.items(), key=lambda x: -x[1]):
-                f.write(f"- {k} ({v})\n")
+    with open(os.path.join(TARGET_DIR, "location_summary.txt"), "w", encoding="utf-8") as f:
+        for d, places in sorted(gps_by_day.items()):
+            date = d.replace(TARGET_DIR + os.sep, "").replace(os.sep, "/")
+            f.write(date + " : " + " | ".join(f"{c}, {ct}" for c, ct in places) + "\n")
 
-########## convert lat lon to decimal
-def convert_to_decimal(dms_list):
-    degrees = float(dms_list[0])
-    minutes = float(dms_list[1])
-    # 處理分數形式的秒數，例如 1899/100
-    seconds = float(dms_list[2])
+    for name, data in [
+        ("reverse_geocode_failed.txt", reverse_geocode_failed),
+        ("file_format_not_recognized.txt", file_format_errors),
+        ("corrupted_exif_files.txt", corrupted_exif_files),
+        ("unclassified_files.txt", unclassified_files),
+        ("used_filename_fallback.txt", filename_fallback_files),
+        ("ffprobe_failed.txt", ffprobe_failed),
+    ]:
+        with open(os.path.join(TARGET_DIR, name), "w", encoding="utf-8") as f:
+            f.write("\n".join(sorted(set(data))))
 
-    return degrees + (minutes / 60.0) + (seconds / 3600.0)
-
-# ========= MAIN =========
+# ================= MAIN =================
 def main():
     os.makedirs(TARGET_DIR, exist_ok=True)
     os.makedirs(TMP_DIR, exist_ok=True)
+    load_geo_cache()
 
-    if os.path.exists(HASH_DB):
-        with open(HASH_DB, "r", encoding="utf-8") as f:
-            hash_index.update(json.load(f))
-
+    tasks = []
     for root, _, files in os.walk(SOURCE_DIR):
         for f in files:
             p = os.path.join(root, f)
-            try:
-                if f.lower().endswith(".zip"):
-                    process_zip(p)
-                elif f.lower().endswith(MEDIA_EXT):
-                    process_media(p)
-            except Exception as e:
-                corrupted_exif_files.append(f"{p} | {e}")
+            if f.lower().endswith(".zip"):
+                with zipfile.ZipFile(p) as z:
+                    for n in z.namelist():
+                        if n.lower().endswith(MEDIA_EXT):
+                            tasks.append(z.extract(n, TMP_DIR))
+            elif f.lower().endswith(MEDIA_EXT):
+                tasks.append(p)
 
-    write_location_files()
+    print(f"📦 Total files: {len(tasks)}")
+    for i, p in enumerate(tasks, 1):
+        process_media(p)
+        if i % 100 == 0:
+            print(f"➡️ {i} processed")
 
-    def dump(path, data):
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("\n".join(sorted(set(data))))
-
-    dump(DUP_FILE, duplicate_files)
-    dump(UNCLASS_FILE, unclassified_files)
-    dump(FMT_ERR_FILE, file_format_errors)
-    dump(CORRUPT_FILE, corrupted_exif_files)
-    dump(FILENAME_FALLBACK_FILE, filename_fallback_files)
-    dump(NO_LOC_FILE, no_loc_files)
-
-    with open(HASH_DB, "w", encoding="utf-8") as f:
-        json.dump(hash_index, f, indent=2)
-
-    print("✅ All done")
-
+    save_geo_cache()
+    write_reports()
+    write_html_map()
+    print("✅ Offline-final processing completed")
 
 if __name__ == "__main__":
     main()
