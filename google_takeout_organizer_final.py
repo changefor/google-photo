@@ -11,6 +11,8 @@ from collections import defaultdict
 import exifread
 import reverse_geocoder as rg
 
+import time
+
 # ================= CONFIG =================
 SOURCE_DIR = r"source"
 TARGET_DIR = r"final"
@@ -278,6 +280,7 @@ def write_reports():
 
 # ================= MAIN =================
 def main():
+    start = time.time()
     os.makedirs(TARGET_DIR, exist_ok=True)
     os.makedirs(TMP_DIR, exist_ok=True)
     load_geo_cache()
@@ -304,6 +307,7 @@ def main():
     write_reports()
     write_html_map()
     print("✅ Offline-final processing completed")
+    print(time.time() - start)
 
 if __name__ == "__main__":
     main()
